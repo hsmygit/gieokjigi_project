@@ -1,0 +1,219 @@
+name: escort CI/CD
+
+on:
+  pull_request:
+    branches:
+      - release
+    types: [closed]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Spring repo
+        uses: actions/checkout@v2
+        with:
+          path: spring
+
+      - name: Checkout AI repo
+        uses: actions/checkout@v2
+        with:
+          repository: K-escort/Python
+          token: ${{ secrets.ACCESS_REPO_TOKEN }}
+          path: ai
+          ref: main
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v3
+        with:
+          java-version: 17
+          distribution: 'adopt'
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACTION_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_ACTION_SECRET_ACCESS_KEY }}
+          aws-region: ap-northeast-2
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x spring/gradlew
+        shell: bash
+
+      - name: Build with Gradle
+        run: cd spring && ./gradlew clean build -x test
+        shell: bash
+
+      - name: Check JAR file existence
+        run: ls -la spring/build/libs
+        shell: bash
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build, tag, and push Spring image to Amazon ECR
+        id: build-spring-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: escort
+          IMAGE_TAG: latest
+        run: |
+          docker buildx build --platform=linux/amd64 -t $ECR_REGISTRY/$ECR_REPOSITORY:spring-$IMAGE_TAG -f spring/Dockerfile spring
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:spring-$IMAGE_TAG
+          echo "::set-output name=spring-image::$ECR_REGISTRY/$ECR_REPOSITORY:spring-$IMAGE_TAG"
+        shell: bash
+
+      - name: Build, tag, and push AI image to Amazon ECR
+        id: build-ai-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: escort
+          IMAGE_TAG: latest
+        run: |
+          docker buildx build --platform=linux/amd64 --no-cache -t $ECR_REGISTRY/$ECR_REPOSITORY:ai-$IMAGE_TAG -f ai/Dockerfile ai
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:ai-$IMAGE_TAG
+          echo "::set-output name=ai-image::$ECR_REGISTRY/$ECR_REPOSITORY:ai-$IMAGE_TAG"
+        shell: bash
+
+      - name: Get current time
+        uses: 1466587594/get-current-time@v2
+        id: current-time
+        with:
+          format: YYYY-MM-DDTHH-mm-ss
+          utcOffset: "+09:00"
+
+      - name: Show Current Time
+        run: echo "CurrentTime=${{ steps.current-time.outputs.formattedTime }}"
+        shell: bash
+
+      - name: Generate deployment package
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: escort
+          IMAGE_TAG: latest
+        run: |
+          export OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+          export PINECONE_API_KEY=${{ secrets.PINECONE_API_KEY }}
+          export UPSTAGE_API_KEY=${{ secrets.UPSTAGE_API_KEY }}
+          export JEMINAI_API_KEY=${{ secrets.JEMINAI_API_KEY }}
+          export GOOGLE_API_KEY=${{ secrets.GOOGLE_API_KEY }}
+          export GOOGLE_GENAI_USE_VERTEXAI=true
+          export GOOGLE_CLOUD_LOCATION=global
+          
+          mkdir -p deploy
+          # docker-compose.yml 생성
+          cat <<EOF > deploy/docker-compose.yml
+          services:
+            nginx:
+                image: nginx:latest
+                ports:
+                  - "80:80"
+                volumes:
+                  - ./.platform/nginx/nginx.conf:/etc/nginx/nginx.conf 
+                depends_on:
+                  - spring
+                  - ai
+            spring:
+              image: $ECR_REGISTRY/$ECR_REPOSITORY:spring-$IMAGE_TAG
+              ports:
+                - "8080:8080"
+              environment:
+                - TZ=${{secrets.TZ}}
+                - spring.datasource.url=${{secrets.SPRING_DATASOURCE_URL}}
+                - spring.datasource.password=${{secrets.SPRING_DATASOURCE_PASSWORD}}
+                - spring.datasource.username=${{secrets.SPRING_DATASOURCE_USERNAME}}
+                - jwt.secret=${{secrets.JWT_SECRET}}
+                - spring.data.redis.host=${{secrets.SPRING_DATA_REDIS_HOST}}
+                - spring.data.redis.port=${{secrets.SPRING_DATA_REDIS_PORT}}
+                - AWS_S3_ACCESS_KEY_ID=${{ secrets.AWS_S3_ACCESS_KEY_ID }}
+                - AWS_S3_SECRET_ACCESS_KEY=${{ secrets.AWS_S3_SECRET_ACCESS_KEY }}
+                - AWS_S3_BUCKET=${{ secrets.AWS_S3_BUCKET }}
+                - KAKAO_CLIENT_ID=${{ secrets.KAKAO_CLIENT_ID }}
+                - KAKAO_REDIRECT_URI=${{ secrets.KAKAO_REDIRECT_URI }}
+          
+            ai:
+              image: $ECR_REGISTRY/$ECR_REPOSITORY:ai-$IMAGE_TAG
+              ports:
+                - "5000:5000"
+              environment:
+                - OPENAI_API_KEY= ${{secrets.OPENAI_API_KEY}}
+                - PINECONE_API_KEY= ${{secrets.PINECONE_API_KEY}}
+                - UPSTAGE_API_KEY= ${{secrets.UPSTAGE_API_KEY}}
+                - JEMINAI_API_KEY= ${{secrets.JEMINAI_API_KEY}}
+                - GOOGLE_API_KEY= ${{secrets.GOOGLE_API_KEY}}
+                - GOOGLE_GENAI_USE_VERTEXAI=true
+                - GOOGLE_CLOUD_LOCATION=global
+          EOF
+          
+          mkdir -p deploy/.platform/nginx
+          cat <<EOF > deploy/.platform/nginx/nginx.conf
+          events {}
+          
+          http {
+             # ---- 기본 전역 설정 ----
+            client_max_body_size 200M;        # 업로드/응답 파일 최대 크기 (기본: 1M)
+            send_timeout 600s;                # 송신 타임아웃
+            proxy_connect_timeout 600s;       # 업스트림 연결 타임아웃
+            proxy_read_timeout 600s;          # 응답 읽기 타임아웃
+            proxy_send_timeout 600s;          # 요청 전송 타임아웃
+            keepalive_timeout 600s;           # 연결 유지 시간
+          
+            upstream spring {
+              server spring:8080;
+            }
+          
+            upstream ai {
+              server ai:5000;
+            }
+          
+            server {
+              listen 80;
+          
+              location / {
+                proxy_pass http://spring;
+                proxy_http_version 1.1;
+                proxy_set_header Connection "";
+                proxy_connect_timeout 600s;
+                proxy_read_timeout 600s;
+                proxy_send_timeout 600s;
+              }
+          
+              location /ai/ {
+                proxy_pass http://ai;
+                proxy_http_version 1.1;
+                proxy_set_header Connection "";
+                proxy_connect_timeout 600s;
+                proxy_read_timeout 600s;
+                proxy_send_timeout 600s;
+              }
+            }
+          }
+          EOF
+          
+          mkdir -p deploy/.platform/hooks/predeploy
+
+          cat <<EOF > deploy/.platform/hooks/predeploy/01_cleanup.sh
+          #!/bin/bash
+          echo "[PREDEPLOY] Stopping existing containers..."
+          docker-compose down || true
+          EOF
+
+          chmod +x deploy/.platform/hooks/predeploy/01_cleanup.sh
+          mkdir -p deploy/.ebextensions
+          cp -r spring/.ebextensions_release/* deploy/.ebextensions
+          cd deploy && zip -r deploy.zip .
+
+      - name: Beanstalk Deploy
+        uses: einaregilsson/beanstalk-deploy@v20
+        with:
+          aws_access_key: ${{ secrets.AWS_ACTION_ACCESS_KEY_ID }}
+          aws_secret_key: ${{ secrets.AWS_ACTION_SECRET_ACCESS_KEY }}
+          application_name: escort-dev
+          environment_name: Escort-dev-env
+          version_label: github-action-${{ steps.current-time.outputs.formattedTime }}
+          region: ap-northeast-2
+          deployment_package: deploy/deploy.zip
+          wait_for_deployment: false

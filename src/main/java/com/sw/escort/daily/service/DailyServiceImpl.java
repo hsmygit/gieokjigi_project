@@ -1,0 +1,121 @@
+package com.sw.escort.daily.service;
+
+import com.sw.escort.apiPayload.code.exception.GeneralException;
+import com.sw.escort.apiPayload.code.status.ErrorStatus;
+import com.sw.escort.daily.dto.res.DailyDtoRes;
+import com.sw.escort.daily.entity.Daily;
+import com.sw.escort.daily.entity.DailyConversation;
+import com.sw.escort.daily.repository.DailyConversationRepository;
+import com.sw.escort.daily.repository.DailyRepository;
+import com.sw.escort.global.util.AmazonS3Util;
+import com.sw.escort.user.entity.User;
+import com.sw.escort.user.repository.UserRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.LocalDate;
+import java.time.YearMonth;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+@Transactional
+public class DailyServiceImpl implements DailyService {
+    private final DailyRepository dailyRepository;
+    private final UserRepository userRepository;
+    private final AmazonS3Util amazonS3Util;
+    private final DailyConversationRepository dailyConversationRepository;
+
+    @Override
+    public void saveFeedback(Long userId, Long patientId, String feedback, LocalDate date){
+        User user = userRepository.findById(userId)
+                .orElseThrow(() -> new GeneralException(ErrorStatus.USER_NOT_FOUND));
+
+        if(!user.getRole().name().equals("HEALER")){
+            throw new GeneralException(ErrorStatus.ONLY_HEALER);
+        }
+        Daily daily = dailyRepository.findByUserIdAndDailyDayRecording(patientId, date).orElseThrow(() -> new GeneralException(ErrorStatus.DAILY_NOT_FOUND));
+        daily.setFeedback(feedback);
+        dailyRepository.flush();
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public DailyDtoRes.DailyRes getDaily(Long userId, LocalDate date){
+        Daily daily = dailyRepository.findByUserIdAndDailyDayRecording(userId, date)
+                .orElseThrow(() -> new GeneralException(ErrorStatus.DAILY_NOT_FOUND));
+        List<String> drawingImageUrls = amazonS3Util.getDailyImagePath(daily.getId());
+        String dailyVideoUrl = amazonS3Util.getDailyVideoPath(daily.getId());
+        if (dailyVideoUrl == null || dailyVideoUrl.isEmpty()) {
+            dailyVideoUrl = null;
+        }
+        List<DailyConversation> dailyConversations = dailyConversationRepository.findByDailyId(daily.getId());
+        List<String> formattedConversations = dailyConversations.stream()
+                .map(conv -> conv.getSpeaker() + ": " + conv.getContent())
+                .collect(Collectors.toList());
+
+        return DailyDtoRes.DailyRes.builder()
+                .createdAt(daily.getCreatedAt())
+                .updatedAt(daily.getUpdatedAt())
+                .dailyDayRecording(daily.getDailyDayRecording())
+                .imageUrls((drawingImageUrls == null || drawingImageUrls.isEmpty()) ? null : drawingImageUrls)
+                .videoUrl(dailyVideoUrl)
+                .conversations(formattedConversations)
+                .feedback(daily.getFeedback())
+                .userId(userId)
+                .id(daily.getId())
+                .build();
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<DailyDtoRes.MonthlyRes> getMonthly(Long userId, YearMonth ym) {
+        LocalDate start = ym.atDay(1);
+        LocalDate end = ym.atEndOfMonth(); // 해당 달의 마지막 날
+
+        List<Daily> monthlies = dailyRepository
+                .findAllByUserIdAndDailyDayRecordingBetweenOrderByDailyDayRecordingAsc(userId, start, end);
+
+        Map<LocalDate, Daily> dailyMap = monthlies.stream()
+                .collect(Collectors.toMap(Daily::getDailyDayRecording, Function.identity()));
+
+        List<DailyDtoRes.MonthlyRes> result = new ArrayList<>();
+        int daysInMonth = ym.lengthOfMonth();
+
+        for (int i = 0; i < daysInMonth; i++) {
+            LocalDate current = start.plusDays(i);
+            Daily daily = dailyMap.get(current);
+
+            if (daily == null) {
+                result.add(DailyDtoRes.MonthlyRes.builder()
+                        .id(null)
+                        .userId(userId)
+                        .monthlyDayRecording(current)
+                        .imageUrl(null)
+                        .build());
+            } else {
+                List<String> imageUrls = amazonS3Util.getDailyImagePath(daily.getId());
+                String imageUrl = (imageUrls != null && !imageUrls.isEmpty())
+                        ? imageUrls.get(0)
+                        : null;
+
+                result.add(DailyDtoRes.MonthlyRes.builder()
+                        .id(daily.getId())
+                        .userId(userId)
+                        .monthlyDayRecording(current)
+                        .imageUrl(imageUrl)
+                        .build());
+            }
+        }
+
+        return result;
+    }
+
+}
