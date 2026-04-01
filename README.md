@@ -45,6 +45,8 @@
 - 영화적 연출 기법 적용으로 몰입감 향상
 <img width="1423" height="730" alt="image" src="https://github.com/user-attachments/assets/a4d15d36-3aeb-4322-982a-57b60ebc60c5" />
 
+- 실행영상 보러가기
+-> https://www.youtube.com/watch?v=TDZO8gM4qU8
 ---
 
 ## 🏗️ 시스템 아키텍처
